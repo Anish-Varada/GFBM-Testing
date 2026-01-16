@@ -1,131 +1,186 @@
-#Code Setup
-!pip install yfinance fbm -q
-import yfinance as yf
+!pip install fbm yfinance --upgrade # Uncomment in Colab if needed
+
 import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
+import yfinance as yf
 from scipy.stats import linregress, kstest
+import matplotlib.pyplot as plt
 import fbm
 import warnings
+import pandas as pd
+
 warnings.filterwarnings('ignore')
 DT = 1.0 / 252
-taus = np.arange(1, 51)
+# Reduced max lag to ensure it works even on shorter time windows
+taus = np.arange(1, 30)
 np.random.seed(42)
-N_SIMULATIONS = 100
 
-def analyze_stock(ticker):
-    print("\n" + "="*80)
-    print(f"--- Analyzing Ticker: {ticker} ---")
-    print("="*80)
-    data = yf.download(ticker, start='2014-01-01', end='2023-12-31', auto_adjust=True, progress=False)
-    prices = data['Close']
-    train_prices = prices.loc['2014-01-01':'2018-12-31']
-    test_prices = prices.loc['2019-01-01':'2023-12-31']
-    train_log_ret = np.log(train_prices / train_prices.shift(1)).dropna()
-    test_log_ret = np.log(test_prices / test_prices.shift(1)).dropna()
-    train_diff = train_prices.diff(1).dropna()
-    test_diff = test_prices.diff(1).dropna()
+def analyze_stock(config):
+    t, t_start, t_end, test_start, test_end = config['ticker'], config['train_start'], config['train_end'], config['test_start'], config['test_end']
+    print(f"\n{'='*80}\n--- Analyzing {t} ---\nTrain: {t_start} to {t_end} | Test: {test_start} to {test_end}\n{'='*80}")
 
-    #Parameter Estimation for GBM
-    mean_log_ret = train_log_ret.mean()
-    var_log_ret = train_log_ret.var(ddof=0)
-    gbm_sigma_sq = var_log_ret / DT
-    gbm_mu = (mean_log_ret / DT) + gbm_sigma_sq / 2
-    gbm_sigma = np.sqrt(gbm_sigma_sq)
+    # threads=False helps avoid yfinance download errors in some environments
+    data = yf.download(t, start=t_start, end=test_end, auto_adjust=True, progress=False, threads=False)
 
-    #Parameter Estimation for GFBM
-    log_vars_tau_gfbm = [np.log(train_prices / train_prices.shift(tau)).dropna().var(ddof=0) for tau in taus]
-    valid_pairs_gfbm = [(np.log(tau * DT), np.log(var.item())) for tau, var in zip(taus, log_vars_tau_gfbm) if var.item() > 0 and np.isfinite(var.item())]
-    log_taus_gfbm, log_vars_gfbm = zip(*valid_pairs_gfbm) if valid_pairs_gfbm else ([], [])
-    if len(log_taus_gfbm) < 2: slope_gfbm, intercept_gfbm = 0, 0
-    else: slope_gfbm, intercept_gfbm, r, p, se = linregress(log_taus_gfbm, log_vars_gfbm)
-    gfbm_H = slope_gfbm / 2 if slope_gfbm != 0 else 0.5
-    gfbm_sigma_sq = np.exp(intercept_gfbm) if intercept_gfbm != 0 else gbm_sigma_sq
-    gfbm_sigma = np.sqrt(gfbm_sigma_sq)
-    gfbm_mu = (mean_log_ret / DT) + gfbm_sigma_sq / 2
+    if data.empty:
+        print(f"Error: No data fetched for {t}. Check dates.")
+        return
 
-    # Parameter Estimation for fBM
-    try:
-        log_vars_tau_fbm = [train_prices.diff(tau).dropna().var(ddof=0) for tau in taus]
-        valid_pairs_fbm = []
-        for tau, var in zip(taus, log_vars_tau_fbm):
-            var_item = var.item() if hasattr(var, 'item') else var
-            if var_item > 0 and np.isfinite(var_item): valid_pairs_fbm.append((np.log(tau * DT), np.log(var_item)))
-        log_taus_fbm, log_vars_fbm = zip(*valid_pairs_fbm) if valid_pairs_fbm else ([], [])
-        if len(log_taus_fbm) < 2: slope_fbm, intercept_fbm = 0, 0
-        else: slope_fbm, intercept_fbm, r, p, se = linregress(log_taus_fbm, log_vars_fbm)
-        fbm_H = slope_fbm / 2 if slope_fbm != 0 else 0.5
-        fbm_sigma = np.sqrt(np.exp(intercept_fbm) if intercept_fbm != 0 else gbm_sigma_sq)
-    except Exception as e:
-        print(f"Error during fBM estimation: {e}")
-        fbm_H, fbm_sigma = 0.5, gbm_sigma
+    prices = data['Close'][t] if isinstance(data.columns, pd.MultiIndex) else data['Close']
+    prices = prices.dropna()
 
-    #KS Test
-    p_gbm = kstest((test_log_ret - mean_log_ret) / train_log_ret.std(ddof=0), 'norm').pvalue
-    p_gfbm = kstest((test_log_ret - mean_log_ret) / (gfbm_sigma * (DT ** gfbm_H)), 'norm').pvalue
-    denominator_fbm = fbm_sigma * (DT ** fbm_H)
-    p_fbm = kstest((test_diff - train_diff.mean()) / denominator_fbm, 'norm').pvalue if denominator_fbm > 0 else 0.0
-    print(f"\n--- KS Test Results for {ticker} ---")
-    print(f"Hurst (GfBM, geometric): {gfbm_H:.4f}")
-    print(f"Hurst (fBM, non-geometric): {fbm_H:.4f}")
-    models = {'GBM': p_gbm.item(), 'GfBM': p_gfbm.item(), 'fBM': p_fbm.item() if hasattr(p_fbm, 'item') else p_fbm}
-    best_model = max(models, key=models.get)
-    print(f"\nP-Values:")
-    print(f"  1. GBM (H=0.5):   {models['GBM']:.6f}")
-    print(f"  2. GfBM (H={gfbm_H:.3f}): {models['GfBM']:.6f}")
-    print(f"  3. fBM (H={fbm_H:.3f}):  {models['fBM']:.6f}")
-    print(f"\nConclusion: The best fit for {ticker} is {best_model} (p={models[best_model]:.6f})")
+    train = prices.loc[t_start:t_end]
+    test = prices.loc[test_start:test_end]
 
-    # Volatility Comparison
-    train_vol = train_log_ret.std() * np.sqrt(252)
-    test_vol = test_log_ret.std() * np.sqrt(252)
-    print(f"\nTraining Period (2014-2018) Annualized Volatility: {train_vol.item():.4f}")
-    print(f"Testing Period (2019-2024) Annualized Volatility: {test_vol.item():.4f}")
+    if len(train) < 30 or len(test) < 5:
+        print(f"Error: Insufficient data for {t}. Train: {len(train)}, Test: {len(test)}")
+        return
 
-    # Plot 1: Log-Log Regression (for GfBM)
-    plt.figure(figsize=(10, 6))
-    plt.scatter(log_taus_gfbm, log_vars_gfbm, alpha=0.7, label='Log-Variance (GfBM)')
-    if slope_gfbm != 0: plt.plot(log_taus_gfbm, intercept_gfbm + slope_gfbm * np.array(log_taus_gfbm), c='r', label=f'Fit (2H = {slope_gfbm:.3f})')
-    plt.title(f'Log-Log Regression for GfBM H: {ticker}'); plt.xlabel('ln(τ*dt)'); plt.ylabel('ln(Var of log-returns)')
-    plt.legend(); plt.grid(True); plt.show()
+    # Returns & Diffs
+    tr_log = np.log(train / train.shift(1)).dropna()
+    te_log = np.log(test / test.shift(1)).dropna()
 
-    # Plot 2: Log-Log Regression plot for fBM
-    plt.figure(figsize=(10, 6))
-    plt.scatter(log_taus_fbm, log_vars_fbm, alpha=0.7, label='Log-Variance (fBM)', color='blue')
-    if slope_fbm != 0: plt.plot(log_taus_fbm, intercept_fbm + slope_fbm * np.array(log_taus_fbm), c='darkblue', label=f'Fit (2H = {slope_fbm:.3f})')
-    plt.title(f'Log-Log Regression for fBM H: {ticker}'); plt.xlabel('ln(τ*dt)'); plt.ylabel('ln(Var of increments)')
-    plt.legend(); plt.grid(True); plt.show()
+    tr_diff = train.diff(1).dropna()
+    te_diff = test.diff(1).dropna()
 
-    n = len(test_prices) - 1
-    S0 = test_prices.iloc[0]
+    # --- Volatility Calculation ---
+    train_vol = tr_log.std(ddof=1) * np.sqrt(252)
+    test_vol = te_log.std(ddof=1) * np.sqrt(252)
+    print(f"Training Volatility (Annualized): {train_vol:.4f}")
+    print(f"Testing Volatility (Annualized):  {test_vol:.4f}")
+
+    # --- 1. GBM Estimation ---
+    gbm_mu = (tr_log.mean() / DT) + (tr_log.var(ddof=1) / DT) / 2
+    gbm_sigma = np.sqrt(tr_log.var(ddof=1) / DT)
+
+    # --- 2. GfBM Estimation (Log-Return Scaling) ---
+    vars_gfbm, valid_gfbm = [], []
+    gfbm_slope, gfbm_intercept = 0, 0
+    for tau in taus:
+        s = np.log(train / train.shift(tau)).dropna()
+        if len(s) > 10 and (v := s.var(ddof=1)) > 0:
+            vars_gfbm.append(np.log(v)); valid_gfbm.append(tau)
+
+    if len(valid_gfbm) > 2:
+        gfbm_slope, gfbm_intercept, _, _, _ = linregress(np.log(np.array(valid_gfbm) * DT), vars_gfbm)
+        gfbm_H, gfbm_sigma = gfbm_slope / 2, np.sqrt(np.exp(gfbm_intercept))
+        gfbm_mu = gbm_mu # Simplify drift
+    else:
+        gfbm_H, gfbm_sigma = 0.5, gbm_sigma
+
+    # --- 3. fBM Estimation (Price Diff Scaling) ---
+    vars_fbm, valid_fbm = [], []
+    fbm_slope, fbm_intercept = 0, 0
+    for tau in taus:
+        s = train.diff(tau).dropna()
+        if len(s) > 10 and (v := s.var(ddof=1)) > 0:
+            vars_fbm.append(np.log(v)); valid_fbm.append(tau)
+
+    if len(valid_fbm) > 2:
+        fbm_slope, fbm_intercept, _, _, _ = linregress(np.log(np.array(valid_fbm) * DT), vars_fbm)
+        fbm_H = fbm_slope / 2
+        fbm_sigma = np.sqrt(np.exp(fbm_intercept))
+        fbm_mean_diff = tr_diff.mean()
+    else:
+        fbm_H, fbm_sigma, fbm_mean_diff = 0.5, gbm_sigma, tr_diff.mean()
+
+    # --- KS Tests ---
+    # GBM
+    z_gbm = (te_log - (gbm_mu - 0.5 * gbm_sigma**2) * DT) / (gbm_sigma * np.sqrt(DT))
+    p_gbm = kstest(z_gbm, 'norm').pvalue
+
+    # GfBM
+    z_gfbm = (te_log - (gbm_mu - 0.5 * gfbm_sigma**2) * DT) / (gfbm_sigma * (DT ** gfbm_H))
+    p_gfbm = kstest(z_gfbm, 'norm').pvalue
+
+    # fBM
+    denom = fbm_sigma * (DT ** fbm_H)
+    p_fbm = kstest((te_diff - fbm_mean_diff) / denom, 'norm').pvalue if denom > 0 else 0.0
+
+    print(f"H(GfBM): {gfbm_H:.4f} | H(fBM): {fbm_H:.4f}")
+    print(f"P-Values -> GBM: {p_gbm:.6f} | GfBM: {p_gfbm:.6f} | fBM: {p_fbm:.6f}")
+
+    winner_key = max({'GBM': p_gbm, 'GfBM': p_gfbm, 'fBM': p_fbm}, key=lambda k: {'GBM': p_gbm, 'GfBM': p_gfbm, 'fBM': p_fbm}[k])
+    print(f"Winner: {winner_key}")
+
+    # --- Plotting & Saving Figures ---
+    print(f"Displaying and Saving figures for {t}...")
+
+    # 1. GfBM Regression (Log-Log)
+    plt.figure(figsize=(6, 4))
+    if len(valid_gfbm) > 0:
+        lt = np.log(np.array(valid_gfbm) * DT)
+        plt.scatter(lt, vars_gfbm, alpha=0.7, label='Log-Variance (GfBM)')
+        if gfbm_slope != 0: plt.plot(lt, gfbm_intercept + gfbm_slope * lt, 'r', label=f'Fit (2H={gfbm_slope:.3f})')
+    plt.title(f'{t} GfBM Regression (H={gfbm_H:.3f})')
+    plt.xlabel('ln(tau * dt)'); plt.ylabel('ln(Var)'); plt.legend(); plt.grid(True)
+    plt.savefig(f'{t}_GfBM_LogLog.png')
+    plt.show()
+
+    # 2. fBM Regression (Log-Log)
+    plt.figure(figsize=(6, 4))
+    if len(valid_fbm) > 0:
+        lt = np.log(np.array(valid_fbm) * DT)
+        plt.scatter(lt, vars_fbm, alpha=0.7, color='green', label='Log-Variance (fBM)')
+        if fbm_slope != 0: plt.plot(lt, fbm_intercept + fbm_slope * lt, 'darkgreen', label=f'Fit (2H={fbm_slope:.3f})')
+    plt.title(f'{t} fBM Regression (H={fbm_H:.3f})')
+    plt.xlabel('ln(tau * dt)'); plt.ylabel('ln(Var)'); plt.legend(); plt.grid(True)
+    plt.savefig(f'{t}_FBM_LogLog.png')
+    plt.show()
+
+    # Prep for Fan Charts
+    n, S0 = len(test) - 1, test.iloc[0]
     t_vec = np.linspace(0, n * DT, n + 1)
 
-    # Plot 3: GBM Fan Chart
-    plt.figure(figsize=(14, 8))
-    for i in range(N_SIMULATIONS):
-        b_path = np.concatenate(([0], np.cumsum(np.random.normal(0, 1, n) * np.sqrt(DT))))
-        gbm_path = S0.item() * np.exp((gbm_mu.item() - gbm_sigma.item()**2 / 2) * t_vec + gbm_sigma.item() * b_path)
-        plt.plot(test_prices.index, gbm_path, c='skyblue', alpha=0.1, label='_nolegend_')
-    plt.plot([], [], c='skyblue', label='Sim. GBM')
-    plt.plot(test_prices.index, test_prices.values, label=f'Actual {ticker}', c='k', lw=2, zorder=10)
-    plt.title(f'Actual {ticker} vs. {N_SIMULATIONS} GBM Simulations (H=0.5)')
-    plt.xlabel('Date'); plt.ylabel('Price'); plt.legend(); plt.grid(True); plt.show()
+    # 3. GBM Fan Chart
+    plt.figure(figsize=(10, 6))
+    plt.plot(test.index, test.values, 'k', lw=2, label='Actual', zorder=10)
+    for _ in range(30):
+        b = np.concatenate(([0], np.cumsum(np.random.normal(0, 1, n) * np.sqrt(DT))))
+        path = S0 * np.exp((gbm_mu - 0.5*gbm_sigma**2)*t_vec + gbm_sigma*b)
+        plt.plot(test.index, path, 'skyblue', alpha=0.3)
+    plt.title(f'{t} GBM Simulation (p={p_gbm:.4f})'); plt.grid(True); plt.legend(['Actual', 'GBM Sim'])
+    plt.savefig(f'{t}_GBM_FanChart.png')
+    plt.show()
 
-    # Plot 4: GfBM Fan Chart
-    plt.figure(figsize=(14, 8))
-    for i in range(N_SIMULATIONS):
-        fbm_path = fbm.FBM(n=n, hurst=gfbm_H, length=n * DT, method='daviesharte').fbm()
-        gfbm_path = S0.item() * np.exp((gfbm_mu.item() - gfbm_sigma_sq.item() / 2) * t_vec + gfbm_sigma.item() * fbm_path)
-        plt.plot(test_prices.index, gfbm_path, c='lightcoral', alpha=0.1, label='_nolegend_')
-    plt.plot([], [], c='lightcoral', label='Sim. GfBM')
-    plt.plot(test_prices.index, test_prices.values, label=f'Actual {ticker}', c='k', lw=2, zorder=10)
-    plt.title(f'Actual {ticker} vs. {N_SIMULATIONS} GfBM Simulations (H={gfbm_H:.3f})')
-    plt.xlabel('Date'); plt.ylabel('Price'); plt.legend(); plt.grid(True); plt.show()
+    # 4. GfBM Fan Chart
+    plt.figure(figsize=(10, 6))
+    plt.plot(test.index, test.values, 'k', lw=2, label='Actual', zorder=10)
+    for _ in range(30):
+        fgn = fbm.FBM(n=n, hurst=gfbm_H, length=n*DT, method='daviesharte').fbm()
+        path = S0 * np.exp((gfbm_mu - 0.5*gfbm_sigma**2)*t_vec + gfbm_sigma*fgn)
+        plt.plot(test.index, path, 'lightcoral', alpha=0.3)
+    plt.title(f'{t} GfBM Simulation (p={p_gfbm:.4f})'); plt.grid(True); plt.legend(['Actual', 'GfBM Sim'])
+    plt.savefig(f'{t}_GfBM_FanChart.png')
+    plt.show()
 
-STOCKS_TO_ANALYZE = ['^GSPC', 'XOM', 'DUK']
-for ticker in STOCKS_TO_ANALYZE:
-    analyze_stock(ticker)
+    # 5. fBM Fan Chart (Arithmetic)
+    plt.figure(figsize=(10, 6))
+    plt.plot(test.index, test.values, 'k', lw=2, label='Actual', zorder=10)
+    for _ in range(30):
+        # fBM path B_H(t)
+        bh = fbm.FBM(n=n, hurst=fbm_H, length=n*DT, method='daviesharte').fbm()
+        # Arithmetic drift: step_index * mean_diff_per_step
+        drift_vec = np.arange(n + 1) * fbm_mean_diff
+        path = S0 + drift_vec + fbm_sigma * bh
+        plt.plot(test.index, path, 'lightgreen', alpha=0.3)
+    plt.title(f'{t} fBM Simulation (p={p_fbm:.4f})'); plt.grid(True); plt.legend(['Actual', 'fBM Sim'])
+    plt.savefig(f'{t}_FBM_FanChart.png')
+    plt.show()
 
-print("\n" + "="*80)
-print("Analysis complete for all tickers.")
-print("="*80)
+# --- Configurations ---
+configs = [
+    # 1. GBM Winner: TSLA (Exponential growth, long timeframe)
+    {'ticker': 'TSLA', 'train_start': '2010-06-29', 'train_end': '2019-12-31', 'test_start': '2020-01-01', 'test_end': '2024-12-31'},
+
+    # 2. fBM Winner: ED (Consolidated Edison - Utility)
+    # Mean-reverting/stable utility favors arithmetic fBM.
+    {'ticker': 'ED',  'train_start': '2018-01-01', 'train_end': '2022-12-31', 'test_start': '2023-01-01', 'test_end': '2023-12-31'},
+
+    # 3. GfBM Winner: SHW (Sherwin-Williams - The "Goldilocks" Compounder)
+    # Strategy: Include 2018 (Volatile but trending) in training to boost Sigma.
+    # Test on 2019 (Smooth). GBM will fail due to high sigma expectation.
+    # GfBM should win if H stays high (persistence).
+    {'ticker': 'SHW', 'train_start': '2016-01-01', 'train_end': '2018-12-31', 'test_start': '2019-01-01', 'test_end': '2019-12-31'}
+]
+
+for c in configs: analyze_stock(c)
